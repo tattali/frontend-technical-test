@@ -22,6 +22,7 @@ export type Authentication = {
   state: AuthenticationState;
   authenticate: (token: string) => void;
   signout: () => void;
+  isValidToken: (token: string) => boolean;
 };
 
 export const AuthenticationContext = createContext<Authentication | undefined>(
@@ -37,6 +38,7 @@ export const AuthenticationProvider: React.FC<PropsWithChildren> = ({
 
   const authenticate = useCallback(
     (token: string) => {
+      localStorage.setItem('jwt_token', token);
       setState({
         isAuthenticated: true,
         token,
@@ -47,12 +49,30 @@ export const AuthenticationProvider: React.FC<PropsWithChildren> = ({
   );
 
   const signout = useCallback(() => {
+    localStorage.removeItem('jwt_token');
     setState({ isAuthenticated: false });
   }, [setState]);
 
+  const isValidToken = useCallback((token: string) => {
+    const exp = jwtDecode(token).exp;
+    if (exp && new Date() < new Date(exp * 1000)) {
+      return true;
+    }
+
+    return false;
+  }, [setState, authenticate]);
+
   const contextValue = useMemo(
-    () => ({ state, authenticate, signout }),
-    [state, authenticate, signout],
+    () => {
+      const token = localStorage.getItem('jwt_token');
+      if (token && isValidToken(token)) {
+        if (!state.isAuthenticated) {
+          authenticate(token);
+        }
+      }
+      return { state, authenticate, signout, isValidToken };
+    },
+    [state, authenticate, signout, isValidToken],
   );
 
   return (
