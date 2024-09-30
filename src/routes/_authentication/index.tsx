@@ -108,6 +108,10 @@ export const MemeFeedPage: React.FC = () => {
   const { mutate } = useMutation({
     mutationFn: async (data: { memeId: string; content: string }) => {
       await createMemeComment(token, data.memeId, data.content);
+
+      queryClient.invalidateQueries({ queryKey: ['memeComments', data.memeId]});
+      queryClient.removeQueries({queryKey:['memeComments', data.memeId]});
+      refetchComments();
     },
   });
   if (statusMeme !== 'success') {
