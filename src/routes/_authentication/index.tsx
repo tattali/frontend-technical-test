@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import {
   Avatar,
@@ -29,58 +29,79 @@ import { Loader } from "../../components/loader";
 import { MemePicture } from "../../components/meme-picture";
 import { useState } from "react";
 import { jwtDecode } from "jwt-decode";
+import { useLastRef } from "../../utils/hooks";
+import { getOrCache } from "../../utils/cache";
+
+type MemeComment = GetMemeCommentsResponse["results"][0] & { author: GetUserByIdResponse; };
+type Meme = GetMemesResponse['results'][0] & { author: GetUserByIdResponse; comments: MemeComment[]; };
 
 export const MemeFeedPage: React.FC = () => {
+  const queryClient = useQueryClient();
+
   const token = useAuthToken();
-  const { isLoading, data: memes } = useQuery({
-    queryKey: ["memes"],
-    queryFn: async () => {
-      const memes: GetMemesResponse["results"] = [];
-      const firstPage = await getMemes(token, 1);
-      memes.push(...firstPage.results);
-      const remainingPages =
-        Math.ceil(firstPage.total / firstPage.pageSize) - 1;
-      for (let i = 0; i < remainingPages; i++) {
-        const page = await getMemes(token, i + 2);
-        memes.push(...page.results);
-      }
-      const memesWithAuthorAndComments = [];
-      for (let meme of memes) {
-        const author = await getUserById(token, meme.authorId);
-        const comments: GetMemeCommentsResponse["results"] = [];
-        const firstPage = await getMemeComments(token, meme.id, 1);
-        comments.push(...firstPage.results);
-        const remainingCommentPages =
-          Math.ceil(firstPage.total / firstPage.pageSize) - 1;
-        for (let i = 0; i < remainingCommentPages; i++) {
-          const page = await getMemeComments(token, meme.id, i + 2);
-          comments.push(...page.results);
-        }
-        const commentsWithAuthor: (GetMemeCommentsResponse["results"][0] & {
-          author: GetUserByIdResponse;
-        })[] = [];
-        for (let comment of comments) {
-          const author = await getUserById(token, comment.authorId);
-          commentsWithAuthor.push({ ...comment, author });
-        }
-        memesWithAuthorAndComments.push({
-          ...meme,
-          author,
-          comments: commentsWithAuthor,
-        });
-      }
-      return memesWithAuthorAndComments;
+  const {
+    data: memes,
+    fetchNextPage: fetchNextPageMeme,
+    status: statusMeme,
+    hasNextPage: hasNextPageMeme,
+    isFetchingNextPage: isFetchingNextPageMeme,
+  } = useInfiniteQuery({
+    queryKey: ['memes'],
+    queryFn: async ({ pageParam }): Promise<Meme[]> => {
+      const memesResponse = await getMemes(token, pageParam);
+      const users = {};
+      const authorResponses = await Promise.all(
+        memesResponse.results.map(
+          (meme) => getOrCache(users, meme.authorId, getUserById, [token, meme.authorId]),
+        ),
+      );
+
+      return memesResponse.results.map((meme, i) => ({
+        ...meme,
+        author: authorResponses[i],
+        comments: [],
+      }));
     },
+    initialPageParam: 1,
+    getNextPageParam: (lastPage, _, lastPageParam) => (lastPage.length === 0) ? undefined : lastPageParam + 1,
   });
+  const memeSentinels = useLastRef(isFetchingNextPageMeme, hasNextPageMeme, fetchNextPageMeme);
+
+  const [openedCommentSection, setOpenedCommentSection] = useState<
+    string | null
+  >(null);
+
+  const {
+    data: memeComments,
+    refetch: refetchComments,
+    fetchNextPage: fetchNextPageMemeComments,
+    hasNextPage: hasNextPageMemeComments,
+    isFetching : isFetchingMemeComments,
+  } = useInfiniteQuery({
+    enabled: !!openedCommentSection,
+    queryKey: ['memeComments', openedCommentSection],
+    queryFn: async ({ pageParam }): Promise<MemeComment[]> => {
+      if (!openedCommentSection) return [];
+      const memeCommentsResponse = await getMemeComments(token, openedCommentSection, pageParam);
+      const authorResponses = await Promise.all(
+        memeCommentsResponse.results.map(
+          (comment) => getUserById(token, comment.authorId)
+        )
+      );
+
+      return memeCommentsResponse.results.map((comment, i) => ({ ...comment, author: authorResponses[i] }));
+    },
+    initialPageParam: 1,
+    getNextPageParam: (lastPage, _, lastPageParam) => (lastPage.length === 0) ? undefined : lastPageParam + 1,
+  });
+  const commentSentinels = useLastRef(isFetchingMemeComments, hasNextPageMemeComments, fetchNextPageMemeComments);
+
   const { data: user } = useQuery({
     queryKey: ["user"],
     queryFn: async () => {
       return await getUserById(token, jwtDecode<{ id: string }>(token).id);
     },
   });
-  const [openedCommentSection, setOpenedCommentSection] = useState<
-    string | null
-  >(null);
   const [commentContent, setCommentContent] = useState<{
     [key: string]: string;
   }>({});
@@ -89,9 +110,10 @@ export const MemeFeedPage: React.FC = () => {
       await createMemeComment(token, data.memeId, data.content);
     },
   });
-  if (isLoading) {
+  if (statusMeme !== 'success') {
     return <Loader data-testid="meme-feed-loader" />;
   }
+
   return (
     <Flex width="full" height="full" justifyContent="center" overflowY="auto">
       <VStack
@@ -100,9 +122,9 @@ export const MemeFeedPage: React.FC = () => {
         maxWidth={800}
         divider={<StackDivider border="gray.200" />}
       >
-        {memes?.map((meme) => {
-          return (
-            <VStack key={meme.id} p={4} width="full" align="stretch">
+        {memes?.pages.map((page) => {
+          return page.map((meme, memeIndex) => (
+            <VStack key={meme.id} p={4} width="full" align="stretch" ref={(e) => (e && memeIndex === page.length - 1) ? memeSentinels(e, 'meme') : undefined}>
               <Flex justifyContent="space-between" alignItems="center">
                 <Flex>
                   <Avatar
@@ -115,7 +137,7 @@ export const MemeFeedPage: React.FC = () => {
                   <Text ml={2} data-testid={`meme-author-${meme.id}`}>{meme.author.username}</Text>
                 </Flex>
                 <Text fontStyle="italic" color="gray.500" fontSize="small">
-                  {format(meme.createdAt)}
+                  {format(meme.createdAt + 'Z')}
                 </Text>
               </Flex>
               <MemePicture pictureUrl={meme.pictureUrl} texts={meme.texts} dataTestId={`meme-picture-${meme.id}`} />
@@ -195,43 +217,47 @@ export const MemeFeedPage: React.FC = () => {
                   </form>
                 </Box>
                 <VStack align="stretch" spacing={4}>
-                  {meme.comments.map((comment) => (
-                    <Flex key={comment.id}>
-                      <Avatar
-                        borderWidth="1px"
-                        borderColor="gray.300"
-                        size="sm"
-                        name={comment.author.username}
-                        src={comment.author.pictureUrl}
-                        mr={2}
-                      />
-                      <Box p={2} borderRadius={8} bg="gray.50" flexGrow={1}>
-                        <Flex
-                          justifyContent="space-between"
-                          alignItems="center"
-                        >
-                          <Flex>
-                            <Text data-testid={`meme-comment-author-${meme.id}-${comment.id}`}>{comment.author.username}</Text>
-                          </Flex>
-                          <Text
-                            fontStyle="italic"
-                            color="gray.500"
-                            fontSize="small"
+                  {memeComments?.pages.map((memeCommentsPage) => {
+                    return memeCommentsPage.map((comment, commentIndex) => (
+                      <Flex key={comment.id} ref={(e) => (e && commentIndex === memeCommentsPage.length - 1) ? commentSentinels(e, meme.id) : undefined}>
+                        <Avatar
+                          borderWidth="1px"
+                          borderColor="gray.300"
+                          size="sm"
+                          name={comment.author.username}
+                          src={comment.author.pictureUrl}
+                          mr={2}
+                        />
+                        <Box p={2} borderRadius={8} bg="gray.50" flexGrow={1}>
+                          <Flex
+                            justifyContent="space-between"
+                            alignItems="center"
                           >
-                            {format(comment.createdAt)}
+                            <Flex>
+                              <Text data-testid={`meme-comment-author-${meme.id}-${comment.id}`}>{comment.author.username}</Text>
+                            </Flex>
+                            <Text
+                              fontStyle="italic"
+                              color="gray.500"
+                              fontSize="small"
+                            >
+                              {format(comment.createdAt + 'Z')}
+                            </Text>
+                          </Flex>
+                          <Text color="gray.500" whiteSpace="pre-line" data-testid={`meme-comment-content-${meme.id}-${comment.id}`}>
+                            {comment.content}
                           </Text>
-                        </Flex>
-                        <Text color="gray.500" whiteSpace="pre-line" data-testid={`meme-comment-content-${meme.id}-${comment.id}`}>
-                          {comment.content}
-                        </Text>
-                      </Box>
-                    </Flex>
-                  ))}
+                        </Box>
+                      </Flex>
+                    ));
+                  })}
+                  {isFetchingMemeComments && <div><Loader /></div>}
                 </VStack>
               </Collapse>
             </VStack>
-          );
+          ));
         })}
+        {isFetchingNextPageMeme && <div><Loader /></div>}
       </VStack>
     </Flex>
   );
